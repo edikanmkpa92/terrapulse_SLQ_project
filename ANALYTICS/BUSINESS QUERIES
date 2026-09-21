@@ -1,0 +1,756 @@
+-- ============================================================================
+-- PROJECT TERRAPULSE — MULTI-SOURCE MARKET INTELLIGENCE & DATA WAREHOUSE
+-- TerraPulse Global Ltd. | SQL Capstone Project | MySQL 8.0+
+-- ============================================================================
+-- NOTE ON ASSUMPTIONS:
+-- The project brief describes the raw source files but does not list their
+-- exact column headers. Staging column names below are inferred from the
+-- brief's data descriptions and the target production schema. Before running
+-- this against your real files, open each raw file and confirm/rename the
+-- stg_* columns in Phase 1.2 to match your actual headers exactly.
+-- ============================================================================
+
+
+-- ============================================================================
+-- PHASE 1: DATABASE ARCHITECTURE (DDL)
+-- ============================================================================
+
+-- 1.1 Fresh database
+DROP DATABASE IF EXISTS terrapulse_dw;
+CREATE DATABASE terrapulse_dw
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+USE terrapulse_dw;
+SHOW VARIABLES LIKE 'local_infile';
+SET GLOBAL local_infile = 1;
+
+SHOW SESSION VARIABLES LIKE 'local_infile';
+
+-- 1.2 STAGING TABLES (stg_*) — all VARCHAR, no constraints, raw load target
+-- ----------------------------------------------------------------------------
+
+DROP TABLE IF EXISTS stg_orders;
+CREATE TABLE stg_orders (
+    order_id            VARCHAR(50),
+    customer_id         VARCHAR(50),
+    product_id          VARCHAR(50),
+    order_date_raw      VARCHAR(50),   -- mixed formats: 2024-01-15 / 01/15/2024 / 15-Jan-2024 / 15/01/2024
+    order_status_raw    VARCHAR(50),   -- dirty casing/whitespace: DELIVERED / delivered / " Delivered "
+    quantity_raw        VARCHAR(50),
+    unit_price_raw      VARCHAR(50),
+    currency_code_raw   VARCHAR(50),   -- USD, EUR, GBP, NGN, CAD, JPY, AED, ZAR
+    discount_pct_raw    VARCHAR(50),
+    shipping_fee_raw    VARCHAR(50)
+) ENGINE=InnoDB;
+
+DROP TABLE IF EXISTS stg_logistics;
+CREATE TABLE stg_logistics (
+    order_id              VARCHAR(50),
+    carrier_name_raw      VARCHAR(100),  -- whitespace padded: "  DHL Express  "
+    tracking_number_raw   VARCHAR(100),
+    ship_date_raw         VARCHAR(50),   -- mixed formats
+    warehouse_origin_raw  VARCHAR(100)
+) ENGINE=InnoDB;
+
+DROP TABLE IF EXISTS stg_customers;
+CREATE TABLE stg_customers (
+    customer_id             VARCHAR(50),
+    first_name_raw          VARCHAR(100),  -- mixed casing: CHIDI / chidi / ChIdI
+    last_name_raw           VARCHAR(100),
+    email_raw               VARCHAR(150),  -- ~2% missing
+    phone_raw                VARCHAR(50),   -- ~8% missing, multiple formats
+    country_raw              VARCHAR(100),
+    city_raw                 VARCHAR(100),
+    loyalty_score_raw        VARCHAR(50),   -- ~6% missing
+    registration_date_raw    VARCHAR(50)
+) ENGINE=InnoDB;
+
+DROP TABLE IF EXISTS stg_products;
+CREATE TABLE stg_products (
+    product_id           VARCHAR(50),
+    sku_code_raw          VARCHAR(50),
+    product_name_raw      VARCHAR(200),
+    category_name_raw     VARCHAR(100),   -- e.g. "Renewable Energy & Solar", "EV Mobility & Charging"
+    unit_cost_raw         VARCHAR(50),
+    retail_price_raw      VARCHAR(50),
+    warehouse_stock_raw   VARCHAR(50)
+) ENGINE=InnoDB;
+
+DROP TABLE IF EXISTS stg_fx_rates;
+CREATE TABLE stg_fx_rates (
+    currency_code_raw   VARCHAR(10),
+    currency_name_raw   VARCHAR(50),
+    rate_to_usd_raw      VARCHAR(50)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 1.3 PRODUCTION TABLES (dim_*, fct_*) — fully typed, PK/FK, NOT NULL, DEFAULT
+-- ----------------------------------------------------------------------------
+
+DROP TABLE IF EXISTS fct_logistics;
+DROP TABLE IF EXISTS fct_orders;
+DROP TABLE IF EXISTS dim_products;
+DROP TABLE IF EXISTS dim_categories;
+DROP TABLE IF EXISTS dim_customers;
+DROP TABLE IF EXISTS dim_currencies;
+
+CREATE TABLE dim_currencies (
+    currency_code   CHAR(3)         NOT NULL PRIMARY KEY,
+    currency_name   VARCHAR(50)     NOT NULL,
+    rate_to_usd     DECIMAL(15,6)   NOT NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE dim_categories (
+    category_id     INT AUTO_INCREMENT PRIMARY KEY,
+    category_name   VARCHAR(100)    NOT NULL UNIQUE
+) ENGINE=InnoDB;
+
+CREATE TABLE dim_products (
+    product_id          INT             NOT NULL PRIMARY KEY,
+    sku_code            VARCHAR(50)     NOT NULL,
+    product_name        VARCHAR(200)    NOT NULL,
+    category_id         INT             NOT NULL,
+    unit_cost_usd       DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
+    retail_price_usd    DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
+    warehouse_stock     INT             NOT NULL DEFAULT 0,
+    CONSTRAINT fk_products_category
+        FOREIGN KEY (category_id) REFERENCES dim_categories(category_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE dim_customers (
+    customer_id         INT             NOT NULL PRIMARY KEY,
+    first_name          VARCHAR(100)    NOT NULL,
+    last_name            VARCHAR(100)    NULL,
+    full_name             VARCHAR(200)    NOT NULL,
+    email                 VARCHAR(150)    NULL,
+    phone_clean           VARCHAR(50)     NULL,
+    country               VARCHAR(100)    NOT NULL DEFAULT 'Unknown',
+    city                  VARCHAR(100)    NULL,
+    loyalty_score         INT             NOT NULL DEFAULT 500,
+    registration_date     DATE            NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE fct_orders (
+    order_id                 INT             NOT NULL PRIMARY KEY,
+    customer_id              INT             NOT NULL,
+    product_id                INT             NOT NULL,
+    currency_code              CHAR(3)         NOT NULL,
+    order_date                  DATE            NOT NULL,
+    order_status                 VARCHAR(30)     NOT NULL,
+    quantity                      INT             NOT NULL DEFAULT 1,
+    unit_price_native              DECIMAL(15,2)   NOT NULL,
+    unit_price_usd                   DECIMAL(15,2)   NOT NULL,
+    gross_amount_usd                  DECIMAL(15,2)   NOT NULL,
+    discount_pct                       DECIMAL(5,2)    NOT NULL DEFAULT 0.00,
+    discount_amount_usd                  DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
+    shipping_fee_usd                       DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
+    net_revenue_usd                          DECIMAL(15,2)   NOT NULL,
+    CONSTRAINT fk_orders_customer  FOREIGN KEY (customer_id)   REFERENCES dim_customers(customer_id),
+    CONSTRAINT fk_orders_product   FOREIGN KEY (product_id)    REFERENCES dim_products(product_id),
+    CONSTRAINT fk_orders_currency  FOREIGN KEY (currency_code) REFERENCES dim_currencies(currency_code)
+) ENGINE=InnoDB;
+
+CREATE TABLE fct_logistics (
+    order_id               INT             NOT NULL PRIMARY KEY,
+    carrier_name            VARCHAR(100)    NOT NULL DEFAULT 'Unassigned',
+    tracking_number          VARCHAR(100)    NULL,
+    ship_date                  DATE            NULL,
+    shipping_lead_days           INT             NULL,
+    warehouse_origin               VARCHAR(100)    NULL,
+    CONSTRAINT fk_logistics_order FOREIGN KEY (order_id) REFERENCES fct_orders(order_id)
+) ENGINE=InnoDB;
+
+
+-- ============================================================================
+-- PHASE 2: INGESTION & STAGING
+-- ============================================================================
+
+-- 2.1 Load raw files into staging.
+-- Easiest path: MySQL Workbench -> right-click stg_* table -> Table Data Import Wizard
+-- for the CSV/TSV files. Alternative via LOAD DATA (adjust path/line terms):
+
+ LOAD DATA INFILE 'C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source1_marketplace_orders.csv'
+ INTO TABLE stg_orders
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS;
+ 
+ SELECT * FROM stg_orders;
+ SELECT * FROM stg_orders LIMIT 20;
+ SELECT COUNT(*) FROM stg_orders;
+
+LOAD DATA INFILE 'C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source2_logistics_fulfillment.tsv'
+INTO TABLE stg_logistics
+ FIELDS TERMINATED BY '\t'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS;
+
+
+SELECT * FROM stg_logistics;
+ 
+ SELECT * FROM stg_logistics LIMIT 20;
+ 
+ SELECT COUNT(*) FROM stg_logistics;
+ 
+
+ 
+-- For the two JSON files (customers, fx_rates), either pre-convert to CSV in
+-- Python/pandas, or load the raw JSON into a single-column temp table and
+-- unpack with JSON_TABLE(), e.g.:
+
+CREATE TABLE tmp_json (doc JSON);
+-- (load the JSON array into tmp_json.doc via LOAD_FILE or app-side insert)
+INSERT INTO stg_customers (customer_id, first_name_raw, last_name_raw, email_raw,
+                            phone_raw, country_raw, city_raw, loyalty_score_raw,
+                            registration_date_raw)
+SELECT jt.* FROM tmp_json,
+JSON_TABLE(doc, '$[*]' COLUMNS (
+    customer_id           VARCHAR(50) PATH '$.customer_id',
+    first_name_raw        VARCHAR(100) PATH '$.first_name',
+	last_name_raw         VARCHAR(100) PATH '$.last_name',
+    email_raw             VARCHAR(150) PATH '$.email',
+    phone_raw             VARCHAR(50)  PATH '$.phone',
+    country_raw           VARCHAR(100) PATH '$.country',
+	city_raw              VARCHAR(100) PATH '$.city',
+	loyalty_score_raw     VARCHAR(50)  PATH '$.loyalty_score',
+    registration_date_raw VARCHAR(50)  PATH '$.registration_date'
+ )) AS jt;
+ 
+ 
+SELECT CAST(LOAD_FILE('C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source5_fx_rates.json') AS CHAR(500)) AS raw_json;
+ 
+ INSERT INTO stg_fx_rates (currency_code_raw, currency_name_raw, rate_to_usd_raw)
+SELECT
+    jt.currency_code,
+    jt.currency_name,
+    jt.rate_to_usd
+FROM (
+SELECT CONVERT(LOAD_FILE('C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source5_fx_rates.json') USING utf8mb4) AS doc
+) AS src,
+JSON_TABLE(
+    src.doc, '$[*]'
+    COLUMNS (
+        currency_code   VARCHAR(10)  PATH '$.currency_code',
+        currency_name   VARCHAR(50)  PATH '$.currency_name',
+        rate_to_usd     VARCHAR(50)  PATH '$.rate_to_usd'
+    )
+) AS jt;
+
+SELECT COUNT(*)
+FROM stg_fx_rates;
+SELECT * 
+FROM stg_fx_rates;
+ 
+ SHOW COLUMNS
+ FROM stg_customers;
+
+ INSERT INTO stg_customers (customer_id, first_name_raw, last_name_raw, email_raw, phone_raw, country_raw, city_raw, loyalty_score_raw, registration_date_raw)
+SELECT
+    jt.customer_id,
+    jt.first_name_raw,
+    jt.last_name_raw,
+    jt.email_raw,
+    jt.phone_raw,
+    jt.country_raw,
+    jt.city_raw,
+    jt.loyalty_score_raw,
+    jt.registration_date_raw
+FROM (
+    SELECT CONVERT(LOAD_FILE('C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source3_customer_demographics.json') USING utf8mb4) AS doc
+) AS src,
+JSON_TABLE(
+    src.doc, '$[*]'
+    COLUMNS (
+        customer_id            VARCHAR(50)  PATH '$.customer_id',
+        first_name_raw         VARCHAR(100) PATH '$.raw_first_name',
+        last_name_raw          VARCHAR(100) PATH '$.raw_last_name',
+        email_raw               VARCHAR(150) PATH '$.contact_email',
+        phone_raw                VARCHAR(50)  PATH '$.raw_phone',
+        country_raw              VARCHAR(100) PATH '$.raw_country',
+        city_raw                 VARCHAR(100) PATH '$.raw_city',
+        loyalty_score_raw        VARCHAR(50)  PATH '$.raw_loyalty_score',
+        registration_date_raw    VARCHAR(50)  PATH '$.raw_registration_date'
+    )
+) AS jt;
+
+
+
+ 
+ SELECT LOAD_FILE('C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source4_supplier_catalog.csv') AS raw_json;
+
+
+
+
+
+
+
+
+
+-- 2.2 Verify ingestion count
+SELECT 'stg_fx_rates'   AS source_table, COUNT(*) AS row_count FROM stg_fx_rates
+UNION ALL
+SELECT 'stg_products',                   COUNT(*) FROM stg_products
+UNION ALL
+SELECT 'stg_customers',                  COUNT(*) FROM stg_customers
+UNION ALL
+SELECT 'stg_orders',                     COUNT(*) FROM stg_orders
+UNION ALL
+SELECT 'stg_logistics',                  COUNT(*) FROM stg_logistics;
+SELECT 'stg_logistics', COUNT(*) FROM stg_logistics;
+
+LOAD DATA INFILE 'C:/ProgramData/MySQL/MySQL Server 8.0/Uploads/raw_source4_supplier_catalog.csv'
+INTO TABLE stg_products
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS;
+
+SELECT COUNT(*)
+FROM fct_orders;
+SELECT *
+FROM fct_orders LIMIT 10;
+
+-- 2.3 Data Quality Audit — document dirty records before cleaning
+
+
+-- 2.3 Data Quality Audit — document dirty records before cleaning
+SELECT
+    (SELECT COUNT(*) FROM stg_customers WHERE phone_raw IS NULL OR TRIM(phone_raw) = '')
+        AS missing_phones,
+    (SELECT COUNT(*) FROM stg_customers WHERE email_raw IS NULL OR TRIM(email_raw) = '')
+        AS missing_emails,
+    (SELECT COUNT(*) FROM stg_customers WHERE loyalty_score_raw IS NULL OR TRIM(loyalty_score_raw) = '')
+        AS missing_loyalty_scores,
+    (SELECT COUNT(*) FROM stg_logistics WHERE ship_date_raw IS NULL OR TRIM(ship_date_raw) = '')
+        AS missing_ship_dates,
+    (SELECT COUNT(DISTINCT order_status_raw) FROM stg_orders)
+        AS distinct_status_variants,
+    (SELECT COUNT(DISTINCT currency_code_raw) FROM stg_orders)
+        AS distinct_currencies,
+    (SELECT COUNT(*) FROM stg_customers c
+        WHERE NOT EXISTS (SELECT 1 FROM stg_orders o WHERE o.customer_id = c.customer_id))
+        AS dormant_customer_candidates;
+
+
+-- ============================================================================
+-- PHASE 3: ETL CLEANING PIPELINE (staging -> production)
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 3.1 Currencies, Categories & Products
+-- ----------------------------------------------------------------------------
+
+INSERT INTO dim_currencies (currency_code, currency_name, rate_to_usd)
+SELECT DISTINCT
+    UPPER(TRIM(currency_code_raw)),
+    TRIM(currency_name_raw),
+    CAST(TRIM(rate_to_usd_raw) AS DECIMAL(15,6))
+FROM stg_fx_rates;
+
+SELECT COUNT(*) FROM dim_currencies;
+
+INSERT INTO dim_categories (category_name)
+SELECT DISTINCT TRIM(category_name_raw)
+FROM stg_products
+WHERE category_name_raw IS NOT NULL AND TRIM(category_name_raw) <> '';
+
+SELECT COUNT(*) FROM dim_categories;
+
+INSERT INTO dim_products (product_id, sku_code, product_name, category_id,
+                           unit_cost_usd, retail_price_usd, warehouse_stock)
+SELECT
+    CAST(p.product_id AS UNSIGNED),
+    TRIM(p.sku_code_raw),
+    TRIM(p.product_name_raw),
+    c.category_id,
+    CAST(TRIM(p.unit_cost_raw) AS DECIMAL(15,2)),
+    CAST(TRIM(p.retail_price_raw) AS DECIMAL(15,2)),
+    CAST(COALESCE(NULLIF(TRIM(p.warehouse_stock_raw), ''), '0') AS UNSIGNED)
+FROM stg_products p
+JOIN dim_categories c ON c.category_name = TRIM(p.category_name_raw);
+
+SELECT COUNT(*) FROM dim_products;
+
+-- ----------------------------------------------------------------------------
+-- 3.2 Customer Standardization
+-- ----------------------------------------------------------------------------
+
+INSERT INTO dim_customers (customer_id, first_name, last_name, full_name,
+                            email, phone_clean, country, city,
+                            loyalty_score, registration_date)
+SELECT
+    CAST(customer_id AS UNSIGNED),
+    CONCAT(UPPER(LEFT(TRIM(first_name_raw), 1)), LOWER(SUBSTRING(TRIM(first_name_raw), 2))) AS first_name,
+    CASE
+        WHEN last_name_raw IS NULL OR TRIM(last_name_raw) = '' THEN NULL
+        ELSE CONCAT(UPPER(LEFT(TRIM(last_name_raw), 1)), LOWER(SUBSTRING(TRIM(last_name_raw), 2)))
+    END AS last_name,
+    CONCAT_WS(' ',
+        CONCAT(UPPER(LEFT(TRIM(first_name_raw), 1)), LOWER(SUBSTRING(TRIM(first_name_raw), 2))),
+        CASE WHEN last_name_raw IS NULL OR TRIM(last_name_raw) = '' THEN NULL
+             ELSE CONCAT(UPPER(LEFT(TRIM(last_name_raw), 1)), LOWER(SUBSTRING(TRIM(last_name_raw), 2)))
+        END
+    ) AS full_name,
+    NULLIF(TRIM(email_raw), '') AS email,
+    NULLIF(TRIM(phone_raw), '') AS phone_clean,
+    COALESCE(NULLIF(TRIM(country_raw), ''), 'Unknown') AS country,
+    NULLIF(TRIM(city_raw), '') AS city,
+    CAST(COALESCE(NULLIF(TRIM(loyalty_score_raw), ''), '500') AS UNSIGNED) AS loyalty_score,
+    -- Normalize 4 date formats: YYYY-MM-DD / MM/DD/YYYY / DD-Mon-YYYY / DD/MM/YYYY
+    CASE
+        WHEN registration_date_raw REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN STR_TO_DATE(registration_date_raw, '%Y-%m-%d')
+        WHEN registration_date_raw REGEXP '^[0-9]{2}-[A-Za-z]{3}-[0-9]{4}$'
+            THEN STR_TO_DATE(registration_date_raw, '%d-%b-%Y')
+        WHEN registration_date_raw REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+            THEN CASE
+                     -- If the first segment can't be a month (>12), it must be DD/MM/YYYY
+                     WHEN CAST(SUBSTRING_INDEX(registration_date_raw, '/', 1) AS UNSIGNED) > 12
+                         THEN STR_TO_DATE(registration_date_raw, '%d/%m/%Y')
+                     ELSE STR_TO_DATE(registration_date_raw, '%m/%d/%Y')
+                 END
+        ELSE NULL
+    END AS registration_date
+FROM stg_customers;
+
+-- ----------------------------------------------------------------------------
+-- 3.3 Order Status & Multi-Currency Conversion
+-- ----------------------------------------------------------------------------
+
+INSERT INTO fct_orders (order_id, customer_id, product_id, currency_code, order_date,
+                         order_status, quantity, unit_price_native, unit_price_usd,
+                         gross_amount_usd, discount_pct, discount_amount_usd,
+                         shipping_fee_usd, net_revenue_usd)
+SELECT
+    CAST(o.order_id AS UNSIGNED),
+    CAST(o.customer_id AS UNSIGNED),
+    CAST(o.product_id AS UNSIGNED),
+    UPPER(TRIM(o.currency_code_raw)),
+    CASE
+        WHEN o.order_date_raw REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN STR_TO_DATE(o.order_date_raw, '%Y-%m-%d')
+        WHEN o.order_date_raw REGEXP '^[0-9]{2}-[A-Za-z]{3}-[0-9]{4}$'
+            THEN STR_TO_DATE(o.order_date_raw, '%d-%b-%Y')
+        WHEN o.order_date_raw REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+            THEN CASE
+                     WHEN CAST(SUBSTRING_INDEX(o.order_date_raw, '/', 1) AS UNSIGNED) > 12
+                         THEN STR_TO_DATE(o.order_date_raw, '%d/%m/%Y')
+                     ELSE STR_TO_DATE(o.order_date_raw, '%m/%d/%Y')
+                 END
+        ELSE NULL
+    END AS order_date,
+    CONCAT(UPPER(LEFT(TRIM(o.order_status_raw), 1)), LOWER(SUBSTRING(TRIM(o.order_status_raw), 2))) AS order_status,
+    CAST(o.quantity_raw AS UNSIGNED) AS quantity,
+    CAST(o.unit_price_raw AS DECIMAL(15,2)) AS unit_price_native,
+    ROUND(CAST(o.unit_price_raw AS DECIMAL(15,6)) * fx.rate_to_usd_raw, 2) AS unit_price_usd,
+    ROUND(CAST(o.unit_price_raw AS DECIMAL(15,6)) * fx.rate_to_usd_raw * CAST(o.quantity_raw AS UNSIGNED), 2) AS gross_amount_usd,
+    CAST(COALESCE(NULLIF(TRIM(o.discount_pct_raw), ''), '0') AS DECIMAL(5,2)) AS discount_pct,
+    ROUND(
+        CAST(o.unit_price_raw AS DECIMAL(15,6)) * fx.rate_to_usd_raw * CAST(o.quantity_raw AS UNSIGNED)
+        * (CAST(COALESCE(NULLIF(TRIM(o.discount_pct_raw), ''), '0') AS DECIMAL(5,2)) / 100), 2
+    ) AS discount_amount_usd,
+    CAST(COALESCE(NULLIF(TRIM(o.shipping_fee_raw), ''), '0') AS DECIMAL(15,2)) AS shipping_fee_usd,
+    ROUND(
+        (CAST(o.unit_price_raw AS DECIMAL(15,6)) * fx.rate_to_usd_raw * CAST(o.quantity_raw AS UNSIGNED))
+        - (CAST(o.unit_price_raw AS DECIMAL(15,6)) * fx.rate_to_usd_raw * CAST(o.quantity_raw AS UNSIGNED)
+           * (CAST(COALESCE(NULLIF(TRIM(o.discount_pct_raw), ''), '0') AS DECIMAL(5,2)) / 100))
+        + CAST(COALESCE(NULLIF(TRIM(o.shipping_fee_raw), ''), '0') AS DECIMAL(15,6)), 2
+    ) AS net_revenue_usd
+FROM stg_orders o
+JOIN stg_fx_rates fx ON UPPER(TRIM(fx.currency_code_raw)) = UPPER(TRIM(o.currency_code_raw));
+
+SELECT COUNT(*)
+FROM stg_orders o
+JOIN stg_fx_rates fx ON UPPER(TRIM(fx.currency_code_raw))=UPPER(TRIM(o.currency_code_raw));
+
+SELECT COUNT(*) FROM fct_orders;
+
+SELECT COUNT(*)
+FROM dim_products;
+
+SELECT COUNT(*) FROM stg_orders o
+LEFT JOIN dim_customers c ON CAST(O.customer_id AS UNSIGNED) = C.customer_id
+WHERE C.customer_id IS NULL;
+
+SELECT DISTINCT currency_code_raw FROM stg_orders;
+
+SELECT COUNT(*) FROM stg_orders o
+LEFT JOIN dim_products p ON CAST(o.product_id AS UNSIGNED) = p.product_id
+WHERE p.product_id IS NULL;
+
+SELECT COUNT(*) FROM stg_orders o
+LEFT JOIN dim_currencies c ON UPPER(TRIM(O.currency_code_raw)) = c.currency_code
+WHERE c.currency_code IS NULL;
+
+SELECT * FROM dim_currencies;
+
+SELECT DISTINCT currency_code_raw
+FROM stg_fx_rates;
+
+
+
+
+-- 3.4 Logistics Cleaning
+-- ----------------------------------------------------------------------------
+
+INSERT INTO fct_logistics (order_id, carrier_name, tracking_number, ship_date,
+                            shipping_lead_days, warehouse_origin)
+SELECT
+    CAST(l.order_id AS UNSIGNED),
+    CASE
+        WHEN l.carrier_name_raw IS NULL OR TRIM(l.carrier_name_raw) = '' THEN 'Unassigned'
+        ELSE CONCAT(UPPER(LEFT(TRIM(l.carrier_name_raw), 1)), LOWER(SUBSTRING(TRIM(l.carrier_name_raw), 2)))
+    END AS carrier_name,
+    NULLIF(TRIM(l.tracking_number_raw), '') AS tracking_number,
+    CASE
+        WHEN l.ship_date_raw REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN STR_TO_DATE(l.ship_date_raw, '%Y-%m-%d')
+        WHEN l.ship_date_raw REGEXP '^[0-9]{2}-[A-Za-z]{3}-[0-9]{4}$'
+            THEN STR_TO_DATE(l.ship_date_raw, '%d-%b-%Y')
+        WHEN l.ship_date_raw REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+            THEN CASE
+                     WHEN CAST(SUBSTRING_INDEX(l.ship_date_raw, '/', 1) AS UNSIGNED) > 12
+                         THEN STR_TO_DATE(l.ship_date_raw, '%d/%m/%Y')
+                     ELSE STR_TO_DATE(l.ship_date_raw, '%m/%d/%Y')
+                 END
+        ELSE NULL
+    END AS ship_date,
+    DATEDIFF(
+        CASE
+            WHEN l.ship_date_raw REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                THEN STR_TO_DATE(l.ship_date_raw, '%Y-%m-%d')
+            WHEN l.ship_date_raw REGEXP '^[0-9]{2}-[A-Za-z]{3}-[0-9]{4}$'
+                THEN STR_TO_DATE(l.ship_date_raw, '%d-%b-%Y')
+            WHEN l.ship_date_raw REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+                THEN CASE
+                         WHEN CAST(SUBSTRING_INDEX(l.ship_date_raw, '/', 1) AS UNSIGNED) > 12
+                             THEN STR_TO_DATE(l.ship_date_raw, '%d/%m/%Y')
+                         ELSE STR_TO_DATE(l.ship_date_raw, '%m/%d/%Y')
+                     END
+            ELSE NULL
+        END,
+        fo.order_date
+    ) AS shipping_lead_days,
+    NULLIF(TRIM(l.warehouse_origin_raw), '') AS warehouse_origin
+FROM stg_logistics l
+JOIN fct_orders fo ON fo.order_id = CAST(l.order_id AS UNSIGNED);
+
+SELECT COUNT(*) FROM fct_logistics;
+
+-- ============================================================================
+-- PHASE 4: BUSINESS INTELLIGENCE QUERIES
+-- ============================================================================
+
+-- Q4.1 — Revenue & Profitability by Product Category (Delivered + Shipped only)
+SELECT
+    dc.category_name,
+    SUM(fo.quantity)                                        AS units_sold,
+    SUM(fo.gross_amount_usd)                                AS gross_revenue,
+    SUM(fo.discount_amount_usd)                             AS discounts_lost,
+    SUM(fo.net_revenue_usd)                                 AS net_revenue,
+    SUM(fo.quantity * dp.unit_cost_usd)                     AS total_cost,
+    SUM(fo.net_revenue_usd) - SUM(fo.quantity * dp.unit_cost_usd) AS gross_profit,
+    ROUND(
+        (SUM(fo.net_revenue_usd) - SUM(fo.quantity * dp.unit_cost_usd))
+        / NULLIF(SUM(fo.net_revenue_usd), 0) * 100, 2
+    ) AS profit_margin_pct
+FROM fct_orders fo
+JOIN dim_products dp   ON dp.product_id = fo.product_id
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+WHERE fo.order_status IN ('Delivered', 'Shipped')
+GROUP BY dc.category_name
+ORDER BY net_revenue DESC;
+
+-- Q4.2 — Geographic Revenue Distribution
+SELECT
+    dcu.country,
+    COUNT(DISTINCT fo.order_id)  AS order_count,
+    SUM(fo.net_revenue_usd)      AS net_revenue,
+    ROUND(SUM(fo.net_revenue_usd) / (SELECT SUM(net_revenue_usd) FROM fct_orders) * 100, 2) AS pct_of_global_revenue
+FROM fct_orders fo
+JOIN dim_customers dcu ON dcu.customer_id = fo.customer_id
+GROUP BY dcu.country
+ORDER BY net_revenue DESC;
+
+-- Q4.3 — Currency Exposure Analysis
+SELECT
+    fo.currency_code,
+    COUNT(*)                              AS order_count,
+    SUM(fo.unit_price_native * fo.quantity) AS native_revenue_total,
+    SUM(fo.gross_amount_usd)              AS usd_equivalent,
+    ROUND(SUM(fo.gross_amount_usd) / (SELECT SUM(gross_amount_usd) FROM fct_orders) * 100, 2) AS pct_global_share
+FROM fct_orders fo
+GROUP BY fo.currency_code
+ORDER BY usd_equivalent DESC;
+-- Highest currency risk = largest non-USD % share from the result above.
+
+-- Q4.4 — Carrier SLA Performance Audit
+SELECT
+    fl.carrier_name,
+    COUNT(*)                       AS total_shipments,
+    ROUND(AVG(fl.shipping_lead_days), 1) AS avg_lead_days,
+    MAX(fl.shipping_lead_days)     AS max_lead_days,
+    CASE
+        WHEN AVG(fl.shipping_lead_days) <= 3 THEN 'Tier 1 - Excellent'
+        WHEN AVG(fl.shipping_lead_days) <= 7 THEN 'Tier 2 - Acceptable'
+        ELSE 'Tier 3 - At Risk'
+    END AS sla_tier
+FROM fct_logistics fl
+WHERE fl.shipping_lead_days IS NOT NULL
+GROUP BY fl.carrier_name
+ORDER BY avg_lead_days ASC;
+
+-- Q4.5 — Customer Value Segmentation
+SELECT
+    dcu.customer_id,
+    dcu.full_name,
+    SUM(fo.net_revenue_usd)                          AS lifetime_spend,
+    COUNT(fo.order_id)                                AS order_count,
+    ROUND(SUM(fo.net_revenue_usd) / COUNT(fo.order_id), 2) AS avg_order_value,
+    CASE
+        WHEN SUM(fo.net_revenue_usd) >= 10000 THEN 'Platinum'
+        WHEN SUM(fo.net_revenue_usd) >= 5000  THEN 'Gold'
+        WHEN SUM(fo.net_revenue_usd) >= 1000  THEN 'Silver'
+        ELSE 'Bronze'
+    END AS customer_segment
+FROM fct_orders fo
+JOIN dim_customers dcu ON dcu.customer_id = fo.customer_id
+GROUP BY dcu.customer_id, dcu.full_name
+ORDER BY lifetime_spend DESC;
+
+-- Q4.6 — Dormant Customer Anti-Join
+SELECT
+    dcu.customer_id,
+    dcu.full_name,
+    dcu.country,
+    dcu.registration_date,
+    DATEDIFF(CURDATE(), dcu.registration_date) AS days_since_registration
+FROM dim_customers dcu
+LEFT JOIN fct_orders fo ON fo.customer_id = dcu.customer_id
+WHERE fo.order_id IS NULL
+ORDER BY days_since_registration DESC;
+
+-- Q4.7 — Dead Stock & Capital Audit
+SELECT
+    dp.product_name,
+    dc.category_name,
+    dp.retail_price_usd,
+    dp.warehouse_stock,
+    ROUND(dp.warehouse_stock * dp.unit_cost_usd, 2) AS capital_tied_up
+FROM dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+LEFT JOIN fct_orders fo ON fo.product_id = dp.product_id
+WHERE fo.order_id IS NULL
+ORDER BY capital_tied_up DESC;
+
+-- Q4.8 — Monthly Revenue Trend (2023 vs 2024)
+SELECT
+    MONTHNAME(fo.order_date)                                            AS month_name,
+    MONTH(fo.order_date)                                                AS month_num,
+    SUM(CASE WHEN YEAR(fo.order_date) = 2023 THEN fo.net_revenue_usd ELSE 0 END) AS revenue_2023,
+    SUM(CASE WHEN YEAR(fo.order_date) = 2024 THEN fo.net_revenue_usd ELSE 0 END) AS revenue_2024
+FROM fct_orders fo
+WHERE YEAR(fo.order_date) IN (2023, 2024)
+GROUP BY MONTH(fo.order_date), MONTHNAME(fo.order_date)
+ORDER BY month_num;
+
+
+-- ============================================================================
+-- PHASE 5: TRANSACTIONS & DATA INTEGRITY
+-- ============================================================================
+
+START TRANSACTION;
+
+-- 5.2 +15% cost increase on Renewable Energy & Solar products
+UPDATE dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+SET dp.unit_cost_usd = ROUND(dp.unit_cost_usd * 1.15, 2)
+WHERE dc.category_name = 'Renewable Energy & Solar';
+
+SAVEPOINT after_solar_update;
+
+-- 5.4 Deliberate error: junior analyst wipes ALL product costs
+UPDATE dim_products SET unit_cost_usd = 50.00;
+
+-- 5.5 Prove the corruption
+SELECT product_id, product_name, unit_cost_usd FROM dim_products LIMIT 10;
+
+-- 5.6 Roll back only the bad update, keeping the correct solar update
+ROLLBACK TO SAVEPOINT after_solar_update;
+
+-- 5.7 Apply the correct +8% increase to EV Mobility & Charging products
+UPDATE dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+SET dp.unit_cost_usd = ROUND(dp.unit_cost_usd * 1.08, 2)
+WHERE dc.category_name = 'EV Mobility & Charging';
+
+-- 5.8 Commit and confirm
+COMMIT;
+
+SELECT dp.product_id, dp.product_name, dc.category_name, dp.unit_cost_usd
+FROM dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+WHERE dc.category_name IN ('Renewable Energy & Solar', 'EV Mobility & Charging')
+ORDER BY dc.category_name, dp.product_id;
+
+
+-- ============================================================================
+-- PHASE 6: VIEWS & REPORTING LAYER
+-- ============================================================================
+
+CREATE OR REPLACE VIEW vw_monthly_revenue_dashboard AS
+SELECT
+    YEAR(fo.order_date)         AS revenue_year,
+    MONTH(fo.order_date)        AS revenue_month,
+    MONTHNAME(fo.order_date)    AS month_name,
+    dc.category_name,
+    SUM(fo.quantity)            AS units_sold,
+    SUM(fo.net_revenue_usd)     AS net_revenue,
+    SUM(fo.net_revenue_usd) - SUM(fo.quantity * dp.unit_cost_usd) AS gross_profit
+FROM fct_orders fo
+JOIN dim_products dp   ON dp.product_id = fo.product_id
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+GROUP BY YEAR(fo.order_date), MONTH(fo.order_date), MONTHNAME(fo.order_date), dc.category_name;
+
+CREATE OR REPLACE VIEW vw_customer_360 AS
+SELECT
+    dcu.customer_id,
+    dcu.full_name,
+    dcu.country,
+    COUNT(fo.order_id)                       AS lifetime_order_count,
+    COALESCE(SUM(fo.net_revenue_usd), 0)     AS total_spend,
+    ROUND(COALESCE(SUM(fo.net_revenue_usd), 0) / NULLIF(COUNT(fo.order_id), 0), 2) AS avg_order_value,
+    MAX(fo.order_date)                       AS last_order_date,
+    dcu.loyalty_score,
+    CASE
+        WHEN dcu.loyalty_score >= 800 THEN 'Elite'
+        WHEN dcu.loyalty_score >= 600 THEN 'Preferred'
+        WHEN dcu.loyalty_score >= 400 THEN 'Standard'
+        ELSE 'New'
+    END AS loyalty_tier
+FROM dim_customers dcu
+LEFT JOIN fct_orders fo ON fo.customer_id = dcu.customer_id
+GROUP BY dcu.customer_id, dcu.full_name, dcu.country, dcu.loyalty_score;
+
+-- Dead stock = stock on hand and no orders in the last 90 days of data.
+-- Returns 0 rows because all 200 products sold in that period.															`
+CREATE OR REPLACE VIEW vw_dead_stock_alert AS
+SELECT
+    dp.product_id,
+    dp.product_name,
+    dc.category_name,
+    dp.warehouse_stock,
+    dp.unit_cost_usd,
+    ROUND(dp.warehouse_stock * dp.unit_cost_usd, 2) AS capital_tied_up
+FROM dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+WHERE dp.warehouse_stock > 0
+  AND NOT EXISTS (
+      SELECT 1
+      FROM fct_orders fo
+      WHERE fo.product_id = dp.product_id
+        AND fo.order_date >= DATE_SUB((SELECT MAX(order_date) FROM fct_orders), INTERVAL 90 DAY)
+  );
+
+-- ============================================================================
+-- END OF SCRIPT
+-- ============================================================================

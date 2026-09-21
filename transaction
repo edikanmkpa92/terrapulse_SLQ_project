@@ -1,0 +1,35 @@
+-- PHASE 5: TRANSACTIONS & DATA INTEGRITY
+
+START TRANSACTION;
+
+-- 5.1 +15% cost increase on Renewable Energy & Solar products
+UPDATE dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+SET dp.unit_cost_usd = ROUND(dp.unit_cost_usd * 1.15, 2)
+WHERE dc.category_name = 'Renewable Energy & Solar';
+
+SAVEPOINT after_solar_update;
+
+-- 5.2 Deliberate error: junior analyst wipes ALL product costs
+UPDATE dim_products SET unit_cost_usd = 50.00;
+
+-- 5.3 Prove the corruption
+SELECT product_id, product_name, unit_cost_usd FROM dim_products LIMIT 10;
+
+-- 5.4 Roll back only the bad update, keeping the correct solar update
+ROLLBACK TO SAVEPOINT after_solar_update;
+
+-- 5.5 Apply the correct +8% increase to EV Mobility & Charging products
+UPDATE dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+SET dp.unit_cost_usd = ROUND(dp.unit_cost_usd * 1.08, 2)
+WHERE dc.category_name = 'EV Mobility & Charging';
+
+-- 5.6 Commit and confirm
+COMMIT;
+
+SELECT dp.product_id, dp.product_name, dc.category_name, dp.unit_cost_usd
+FROM dim_products dp
+JOIN dim_categories dc ON dc.category_id = dp.category_id
+WHERE dc.category_name IN ('Renewable Energy & Solar', 'EV Mobility & Charging')
+ORDER BY dc.category_name, dp.product_id;
